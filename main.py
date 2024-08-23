@@ -1,17 +1,65 @@
 import socket
+import scapy.all as scapy
+import prettytable
 
-def get_service_banner(ip, port):
+def scan_network(ip_range):
+    arp_request = scapy.ARP(pdst=ip_range)
+    broadcast = scapy.Ether(dst="ff:ff:ff:ff:ff:ff")
+    arp_request_broadcast = broadcast / arp_request
+    answered_list = scapy.srp(arp_request_broadcast, timeout=1, verbose=False)[0]
+    
+    devices = []
+    for element in answered_list:
+        device = {
+            "ip": element[1].psrc,
+            "mac": element[1].hwsrc,
+            "name": socket.getfqdn(element[1].psrc)  # Get device name using the IP address
+        }
+        devices.append(device)
+    return devices
+
+def display_devices(devices):
+    table = prettytable.PrettyTable()
+    table.field_names = ["Device Name", "IP Address", "MAC Address"]
+    table.align = "l"  # Left align columns
+    table.max_width = 20  # Set a maximum width for each column to avoid disorganization
+
+    for device in devices:
+        table.add_row([device["name"], device["ip"], device["mac"]])
+    print(table)
+
+def get_service_banner(ip, port, protocol='tcp'):
     try:
-        # Create a TCP socket
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        if protocol == 'tcp':
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        elif protocol == 'udp':
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        else:
+            return None
+        
         sock.settimeout(2)
         
-        # Connect to the port
-        sock.connect((ip, port))
+        if protocol == 'tcp':
+            sock.connect((ip, port))
+            sock.sendall(b"HEAD / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            banner = sock.recv(1024).decode().strip()
+
+            if not banner:
+                sock.sendall(b"\n")
+                banner = sock.recv(1024).decode().strip()
+                if not banner:
+                    sock.sendall(b"HELP\r\n")
+                    banner = sock.recv(1024).decode().strip()
+                    
+        else:
+            sock.sendto(b'\x00', (ip, port))
+            data, _ = sock.recvfrom(1024)
+            banner = data.decode().strip()
         
-        # Try to receive the banner
-        banner = sock.recv(1024).decode().strip()
         return banner
+    except socket.gaierror:
+        print(f"Error: Unable to resolve IP address {ip}")
+        return None
     except:
         return None
     finally:
@@ -19,16 +67,10 @@ def get_service_banner(ip, port):
 
 def scan_tcp_port(ip, port):
     try:
-        # Create a TCP socket
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(2)
-        
-        # Attempt to connect to the target IP and TCP port
         result = sock.connect_ex((ip, port))
-        if result == 0:
-            return True  # TCP Port is open
-        else:
-            return False  # TCP Port is closed
+        return result == 0
     except socket.error:
         return False
     finally:
@@ -36,52 +78,101 @@ def scan_tcp_port(ip, port):
 
 def scan_udp_port(ip, port):
     try:
-        # Create a UDP socket
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.settimeout(2)
-        
-        # Sending an empty UDP packet to the target IP and port
-        sock.sendto(b'', (ip, port))
-        
-        # Attempt to receive a response (if any)
+        sock.sendto(b'\x00', (ip, port))
         try:
             data, _ = sock.recvfrom(1024)
-            return True  # UDP Port is open
+            return True
         except socket.timeout:
-            return False  # UDP Port might be open (no response could mean it's open)
+            return False
         except socket.error:
-            return False  # UDP Port is closed
+            return False
     finally:
         sock.close()
 
-def scan_ports(ip, num_ports):
-    open_tcp_ports = []
-    open_udp_ports = []
-    print(f"Scanning {ip} for open TCP and UDP ports...")
+def get_service_name(port, protocol='tcp'):
+    try:
+        return socket.getservbyport(port, protocol)
+    except:
+        return None
 
-    for port in range(1, num_ports + 1):  # Scanning ports from 1 to the user-specified range
+def extract_specific_fields(banner):
+    specific_fields = {}
+    lines = banner.split('\n')
+    remaining_banner = []
+
+    for line in lines:
+        if line.startswith("Date:"):
+            specific_fields['Date'] = line
+        elif line.startswith("Server:"):
+            specific_fields['Server'] = line
+        elif line.startswith("X-Powered-By:"):
+            specific_fields['X-Powered-By'] = line
+        elif line.startswith("Content-Type:"):
+            specific_fields['Content-Type'] = line
+        else:
+            remaining_banner.append(line)
+
+    return specific_fields, "\n".join(remaining_banner).strip()
+
+def scan_ports(ip, num_ports):
+    table = prettytable.PrettyTable()
+    table.field_names = ["Port", "Service", "Version", "Protocol"]
+    table.align = "l"  # Left align columns
+    table.max_width = 40  # Set a maximum width for each column to keep things organized
+    detailed_info = []
+
+    print(f"Scanning {ip} for open TCP and UDP ports...\n")
+
+    for port in range(1, num_ports + 1):
+        # TCP Port Scanning
         if scan_tcp_port(ip, port):
-            banner = get_service_banner(ip, port)
+            service_name = get_service_name(port, 'tcp')
+            banner = get_service_banner(ip, port, 'tcp')
             if banner:
-                print(f"Port {port} is open (TCP) - Service: {banner}")
+                specific_fields, remaining_banner = extract_specific_fields(banner)
+                table.add_row([port, service_name or 'Unknown', remaining_banner or 'N/A', 'TCP'])
+                detailed_info.append(specific_fields)
             else:
-                print(f"Port {port} is open (TCP)")
-            open_tcp_ports.append(port)
+                table.add_row([port, service_name or 'Unknown', 'N/A', 'TCP'])
         
+        # UDP Port Scanning
         if scan_udp_port(ip, port):
-            print(f"Port {port} is open (UDP)")
-            open_udp_ports.append(port)
+            service_name = get_service_name(port, 'udp')
+            banner = get_service_banner(ip, port, 'udp')
+            if banner:
+                specific_fields, remaining_banner = extract_specific_fields(banner)
+                table.add_row([port, service_name or 'Unknown', remaining_banner or 'N/A', 'UDP'])
+                detailed_info.append(specific_fields)
+            else:
+                table.add_row([port, service_name or 'Unknown', 'N/A', 'UDP'])
     
-    if open_tcp_ports:
-        print(f"\nOpen TCP ports on {ip}: {open_tcp_ports}")
-        
-    if open_udp_ports:
-        print(f"\nOpen UDP ports on {ip}: {open_udp_ports}")
+    if table.rowcount > 0:
+        print(table)
+        for fields in detailed_info:
+            for key, value in fields.items():
+                print(value)
+    else:
+        print("No open ports found.")
 
 if __name__ == "__main__":
-    target_ip = input("Enter the IP address to scan: ")
-    
-    # Prompt the user for the number of ports to scan
+    # Step 1: Allow user to input the subnet
+    subnet = input("Enter the subnet to scan (e.g., 192.168.1.0/24): ")
+    print(f"Scanning the subnet: {subnet}")
+
+    # Step 2: Discover devices on the subnet
+    devices = scan_network(subnet)
+    if devices:
+        print("\nDevices found on the subnet:")
+        display_devices(devices)
+    else:
+        print("No devices found on the subnet.")
+        exit()
+
+    # Step 3: Allow the user to select a device for port scanning
+    target_ip = input("\nEnter the IP address of the device to scan: ")
+
     while True:
         try:
             num_ports = int(input("Enter the number of ports to scan (between 10 and 1000): "))
@@ -92,5 +183,5 @@ if __name__ == "__main__":
         except ValueError:
             print("Invalid input. Please enter a valid number.")
     
+    # Step 4: Run the port scan on the selected device
     scan_ports(target_ip, num_ports)
-
